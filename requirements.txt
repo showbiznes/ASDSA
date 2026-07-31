@@ -1,0 +1,8 @@
+# Лёгкие зависимости для bothost.ru Basic (1 GB RAM)
+# Без torch, без CLIP — всего ~50 МБ
+discord.py==2.3.2
+Pillow==10.3.0
+aiohttp==3.9.5
+pytesseract==0.3.10
+python-dotenv==1.0.1
+imagehash==4.3.1
