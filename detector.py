@@ -1,125 +1,289 @@
 # =============================================================================
-# detector.py — Детекция спам-изображений БЕЗ нейросетей (v2 — без фолзов)
+# detector.py — Детекция спам-изображений по ПРИМЕРАМ (few-shot)
 # =============================================================================
-# ПРАВИЛО: Цвет НИКОГДА не блокирует сам по себе!
-# Блокируют только:
-#   1. OCR HIGH (нашли слово "казино", "rasowin", "1xbet" и т.д.)
-#   2. OCR MEDIUM (2+ подозрительных слова)
-#   3. Хеш (совпадение с известным спамом)
-#   4. OCR + Цвет вместе (комбо-буст)
+# Принцип: администратор добавляет примеры спама через !addspam
+# Бот запоминает "отпечаток" каждого примера (хеши + гистограмма + сетка цвета)
+# Новые изображения сравниваются со ВСЕМИ примерами
+# Если похоже на ЛЮБОЙ пример → спам
+#
+# Работает без torch/CLIP — только PIL + imagehash (~50 МБ RAM)
 # =============================================================================
 
-import colorsys
 import io
 import json
 import logging
-import re
+import math
+from datetime import datetime
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageFilter
 
 import config
 
 logger = logging.getLogger("antispam.detector")
 
-
-# ---------------------------------------------------------------------------
-# Ключевые слова OCR — ВЫСОКИЙ приоритет (одного достаточно для блокировки)
-# ---------------------------------------------------------------------------
-SPAM_KEYWORDS_HIGH = [
-    # Названия казино-сайтов и букмекеров
-    "rasowin", "mellgams", "mellgames", "mell coins",
-    "1xbet", "1хбет", "1xstavka", "1хставка",
-    "melbet", "мелбет", "fonbet", "фонбет",
-    "winline", "betwinner", "bwin", "betway", "pin-up", "пин-ап",
-    "вулкан казино", "vulkan casino", "joycasino", "cat casino",
-    # Прямые слова
-    "казино", "casino",
-    "игровые автоматы", "slot machine",
-    "withdrawal success", "withdrawal of $",
-    "вывод средств успешен",
-    "rakeback", "vip-club",
-    "mellgams.com",
-]
-
-# ---------------------------------------------------------------------------
-# Ключевые слова OCR — СРЕДНИЙ приоритет (нужно 3+ совпадения)
-# ---------------------------------------------------------------------------
-SPAM_KEYWORDS_MEDIUM = [
-    "слоты", "slots", "джекпот", "jackpot",
-    "рулетка", "roulette", "букмекер", "bookmaker",
-    "фриспин", "freespin", "free spin",
-    "промокод", "promo code",
-    "ставки на спорт", "sports betting",
-    "покер онлайн", "poker online",
-    "usdt", "trc20", "bep20",
-    "выигрыш гарантирован", "гарантированный выигрыш",
-    "раздаёт 10000", "раздает рублей",
-    "регистрации деньги", "на баланс при регистрации",
-    "cashback casino", "кэшбек казино",
-]
-
-# URL-паттерны
-URL_PATTERN = re.compile(
-    r"(https?://|www\.)\S+\.(com|ru|net|io|me|cc|org)\S*",
-    re.IGNORECASE,
-)
+# Путь к базе примеров спама
+SPAM_DB_PATH = Path(config.HASH_DB_PATH)
 
 
-# ---------------------------------------------------------------------------
-# Цветовые диапазоны казино (используются ТОЛЬКО для буста, не для блокировки)
-# ---------------------------------------------------------------------------
-CASINO_DARK_BLUE = {
-    "hue_min": 200, "hue_max": 270,
-    "sat_min": 40,
-    "val_max": 120,
-}
+class SpamFingerprint:
+    """
+    «Отпечаток» изображения — набор признаков для сравнения похожести.
 
-CASINO_GREEN = {
-    "hue_min": 90, "hue_max": 150,
-    "sat_min": 50,
-    "val_min": 130,
-}
+    Признаки:
+      1. phash (перцептивный хеш) — общая структура
+      2. dhash (разностный хеш) — локальные градиенты
+      3. ahash (средний хеш) — яркость
+      4. color_hist — гистограмма цвета (48 бинов: 16R + 16G + 16B)
+      5. grid_colors — средний цвет в сетке 4x4 (пространственная раскладка)
+    """
+
+    def __init__(self, image: Image.Image):
+        import imagehash
+
+        img = image.convert("RGB")
+
+        # Хеши (разные алгоритмы ловят разные типы похожести)
+        self.phash = str(imagehash.phash(img, hash_size=16))
+        self.dhash = str(imagehash.dhash(img, hash_size=16))
+        self.ahash = str(imagehash.average_hash(img, hash_size=16))
+
+        # Гистограмма цвета (48 бинов — компактно но информативно)
+        self.color_hist = self._compute_histogram(img)
+
+        # Сетка цветов 4×4 (сохраняет пространственную раскладку)
+        self.grid_colors = self._compute_grid(img)
+
+    def _compute_histogram(self, img: Image.Image) -> list:
+        """Вычисляет нормализованную цветовую гистограмму (48 бинов)."""
+        thumb = img.resize((64, 64))
+        pixels = list(thumb.getdata())
+        total = len(pixels)
+
+        # 16 бинов на каждый канал (R, G, B)
+        bins = [0] * 48
+        for r, g, b in pixels:
+            bins[r * 16 // 256] += 1           # R: бины 0-15
+            bins[16 + g * 16 // 256] += 1      # G: бины 16-31
+            bins[32 + b * 16 // 256] += 1      # B: бины 32-47
+
+        # Нормализация → сумма = 1.0
+        s = sum(bins) or 1
+        return [round(b / s, 6) for b in bins]
+
+    def _compute_grid(self, img: Image.Image) -> list:
+        """Средний цвет в каждой ячейке сетки 4×4 (16 ячеек)."""
+        thumb = img.resize((64, 64))
+        pixels = thumb.load()
+        grid = []
+        cell = 16  # 64 / 4
+
+        for gy in range(4):
+            for gx in range(4):
+                r_sum = g_sum = b_sum = 0
+                count = 0
+                for y in range(gy * cell, (gy + 1) * cell):
+                    for x in range(gx * cell, (gx + 1) * cell):
+                        r, g, b = pixels[x, y]
+                        r_sum += r
+                        g_sum += g
+                        b_sum += b
+                        count += 1
+                grid.append([
+                    round(r_sum / count),
+                    round(g_sum / count),
+                    round(b_sum / count),
+                ])
+
+        return grid
+
+    def to_dict(self) -> dict:
+        """Сериализация для JSON."""
+        return {
+            "phash": self.phash,
+            "dhash": self.dhash,
+            "ahash": self.ahash,
+            "color_hist": self.color_hist,
+            "grid_colors": self.grid_colors,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SpamFingerprint":
+        """Десериализация из JSON."""
+        fp = object.__new__(cls)
+        fp.phash = data["phash"]
+        fp.dhash = data["dhash"]
+        fp.ahash = data["ahash"]
+        fp.color_hist = data["color_hist"]
+        fp.grid_colors = data["grid_colors"]
+        return fp
+
+    def similarity(self, other: "SpamFingerprint") -> float:
+        """
+        Вычисляет похожесть с другим отпечатком.
+
+        Returns:
+            Число от 0.0 (совсем не похоже) до 1.0 (идентично)
+        """
+        import imagehash
+
+        # --- 1. Хеш-сходство (30% веса) ---
+        hash_scores = []
+        for attr in ("phash", "dhash", "ahash"):
+            try:
+                h1 = imagehash.hex_to_hash(getattr(self, attr))
+                h2 = imagehash.hex_to_hash(getattr(other, attr))
+                max_dist = h1.hash.size  # максимальное расстояние
+                dist = h1 - h2
+                score = 1.0 - (dist / max_dist)
+                hash_scores.append(max(score, 0.0))
+            except Exception:
+                hash_scores.append(0.0)
+
+        hash_sim = sum(hash_scores) / len(hash_scores) if hash_scores else 0.0
+
+        # --- 2. Гистограмма (40% веса) ---
+        hist_sim = self._histogram_similarity(self.color_hist, other.color_hist)
+
+        # --- 3. Сетка цветов (30% веса) ---
+        grid_sim = self._grid_similarity(self.grid_colors, other.grid_colors)
+
+        # --- Взвешенный итог ---
+        total = hash_sim * 0.30 + hist_sim * 0.40 + grid_sim * 0.30
+
+        return total
+
+    @staticmethod
+    def _histogram_similarity(h1: list, h2: list) -> float:
+        """
+        Histogram intersection — классическая метрика сравнения гистограмм.
+        Возвращает 0.0 - 1.0 (1.0 = идентичны).
+        """
+        if not h1 or not h2 or len(h1) != len(h2):
+            return 0.0
+        return sum(min(a, b) for a, b in zip(h1, h2))
+
+    @staticmethod
+    def _grid_similarity(g1: list, g2: list) -> float:
+        """
+        Сравнивает сетки цветов — евклидово расстояние, нормализованное.
+        """
+        if not g1 or not g2 or len(g1) != len(g2):
+            return 0.0
+
+        total_dist = 0.0
+        for c1, c2 in zip(g1, g2):
+            dr = c1[0] - c2[0]
+            dg = c1[1] - c2[1]
+            db = c1[2] - c2[2]
+            total_dist += math.sqrt(dr * dr + dg * dg + db * db)
+
+        # Максимальное расстояние = 16 ячеек × sqrt(255²×3) ≈ 16 × 441 = 7065
+        max_dist = len(g1) * 441.67
+        return max(1.0 - total_dist / max_dist, 0.0)
 
 
 class ImageDetector:
     """
-    Детектор спам-изображений без нейросетей.
-    Цвет НИКОГДА не блокирует сам по себе — только OCR и хеши.
+    Детектор спам-изображений на основе примеров.
+
+    Администратор добавляет примеры спама через !addspam.
+    Бот сравнивает каждое новое изображение со ВСЕМИ примерами.
+    Если похоже на ЛЮБОЙ пример → удаляет.
     """
 
+    # Порог похожести — если выше, считается спамом
+    SIMILARITY_THRESHOLD = 0.55
+
     def __init__(self) -> None:
-        self._load_known_hashes()
+        self.examples: list[dict] = []  # [{fingerprint, filename, added_by, ...}]
+        self._load_examples()
         logger.info(
-            "ImageDetector v2 запущен (OCR=✓, Цвет=буст, Хеши=%d шт)",
-            len(self.known_hashes),
+            "ImageDetector v3 (few-shot) | примеров спама: %d | порог: %.0f%%",
+            len(self.examples), self.SIMILARITY_THRESHOLD * 100,
         )
 
-    def _load_known_hashes(self) -> None:
-        """Загружает известные хеши спам-изображений."""
-        self.known_hashes = set()
-        hash_path = Path(config.HASH_DB_PATH)
-        if hash_path.exists():
-            try:
-                data = json.loads(hash_path.read_text(encoding="utf-8"))
-                self.known_hashes = set(data.get("hashes", []))
-                logger.info("Загружено %d спам-хешей", len(self.known_hashes))
-            except Exception as e:
-                logger.error("Ошибка загрузки хешей: %s", e)
-
-    def _save_hash(self, phash_str: str) -> None:
-        """Сохраняет хеш в базу."""
-        self.known_hashes.add(phash_str)
+    def _load_examples(self) -> None:
+        """Загружает базу примеров спама из JSON."""
+        self.examples = []
+        if not SPAM_DB_PATH.exists():
+            return
         try:
-            data = {"hashes": list(self.known_hashes)}
-            Path(config.HASH_DB_PATH).write_text(
-                json.dumps(data, indent=2), encoding="utf-8"
+            data = json.loads(SPAM_DB_PATH.read_text(encoding="utf-8"))
+            for ex in data.get("examples", []):
+                ex["fingerprint"] = SpamFingerprint.from_dict(ex["fingerprint"])
+                self.examples.append(ex)
+            logger.info("Загружено %d примеров спама", len(self.examples))
+        except Exception as e:
+            logger.error("Ошибка загрузки примеров: %s", e)
+
+    def _save_examples(self) -> None:
+        """Сохраняет базу примеров."""
+        try:
+            data = {"examples": []}
+            for ex in self.examples:
+                data["examples"].append({
+                    "filename": ex.get("filename", ""),
+                    "added_by": ex.get("added_by", ""),
+                    "added_at": ex.get("added_at", ""),
+                    "fingerprint": ex["fingerprint"].to_dict(),
+                })
+            SPAM_DB_PATH.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
             )
         except Exception as e:
-            logger.error("Ошибка сохранения хеша: %s", e)
+            logger.error("Ошибка сохранения примеров: %s", e)
+
+    def add_example(self, image_data: bytes, filename: str = "", added_by: str = "") -> str:
+        """
+        Добавляет изображение как пример спама.
+
+        Returns:
+            Сообщение о результате.
+        """
+        try:
+            image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            fp = SpamFingerprint(image)
+
+            # Проверяем, не добавлен ли уже похожий пример
+            for ex in self.examples:
+                sim = fp.similarity(ex["fingerprint"])
+                if sim >= 0.85:
+                    return (
+                        f"⚠️ Похожий пример уже есть (сходство {sim:.0%}). "
+                        f"Не добавлено."
+                    )
+
+            self.examples.append({
+                "filename": filename,
+                "added_by": added_by,
+                "added_at": datetime.utcnow().isoformat(),
+                "fingerprint": fp,
+            })
+            self._save_examples()
+
+            return (
+                f"✅ Пример добавлен! Всего в базе: **{len(self.examples)}** примеров.\n"
+                f"Бот теперь будет ловить похожие изображения."
+            )
+
+        except Exception as e:
+            logger.error("Ошибка добавления примера: %s", e)
+            return f"❌ Ошибка: {e}"
+
+    def remove_example(self, index: int) -> str:
+        """Удаляет пример по номеру (1-based)."""
+        idx = index - 1
+        if 0 <= idx < len(self.examples):
+            removed = self.examples.pop(idx)
+            self._save_examples()
+            return f"✅ Пример #{index} удалён ({removed.get('filename', '?')})"
+        return f"❌ Нет примера #{index}. Всего примеров: {len(self.examples)}"
 
     def reload(self) -> bool:
-        self._load_known_hashes()
+        """Перезагрузка базы примеров."""
+        self._load_examples()
         return True
 
     # -----------------------------------------------------------------------
@@ -128,173 +292,79 @@ class ImageDetector:
 
     def predict(self, image_data: bytes) -> tuple:
         """
-        Returns: (is_spam, confidence, method_description)
+        Сравнивает изображение со всеми примерами спама.
+
+        Returns:
+            (is_spam, confidence, method_description)
         """
-        # --- 1. Хеш (мгновенная проверка) ---
-        hash_match = self._check_hash(image_data)
-        if hash_match:
-            return True, 0.95, "hash (известный спам)"
-
-        # --- 2. OCR ---
-        ocr_spam, ocr_conf, ocr_details = self._analyze_ocr(image_data)
-
-        # --- 3. Цвет (только для буста OCR, не блокирует сам) ---
-        has_casino_colors = self._has_casino_palette(image_data)
-
-        # --- Решение ---
-
-        # OCR нашёл спам
-        if ocr_spam:
-            if has_casino_colors:
-                # OCR + цвет = бустим уверенность
-                boosted = min(ocr_conf * 1.25, 0.98)
-                method = f"ocr+color({ocr_details})"
-                logger.info("КОМБО: %s → %.0f%%", method, boosted * 100)
-                self._auto_save_hash(image_data)
-                return True, boosted, method
-            else:
-                # Только OCR
-                logger.info("OCR: %s → %.0f%%", ocr_details, ocr_conf * 100)
-                if ocr_conf >= config.CONFIDENCE_THRESHOLD:
-                    self._auto_save_hash(image_data)
-                return ocr_conf >= config.CONFIDENCE_THRESHOLD, ocr_conf, f"ocr({ocr_details})"
-
-        # Ничего не нашли — НЕ спам
-        return False, 0.0, "clean"
-
-    # -----------------------------------------------------------------------
-    # Метод 1: Перцептивный хеш
-    # -----------------------------------------------------------------------
-
-    def _check_hash(self, image_data: bytes) -> bool:
-        try:
-            import imagehash
-            image = Image.open(io.BytesIO(image_data)).convert("RGB")
-            phash = imagehash.phash(image, hash_size=12)
-            phash_str = str(phash)
-
-            if phash_str in self.known_hashes:
-                logger.info("Хеш-совпадение: %s", phash_str)
-                return True
-
-            for known in self.known_hashes:
-                try:
-                    known_hash = imagehash.hex_to_hash(known)
-                    if phash - known_hash <= 8:
-                        logger.info("Похожий хеш: %s ≈ %s (dist=%d)",
-                                    phash_str, known, phash - known_hash)
-                        return True
-                except Exception:
-                    continue
-
-        except ImportError:
-            logger.debug("imagehash не установлен")
-        except Exception as e:
-            logger.debug("Ошибка хеша: %s", e)
-        return False
-
-    # -----------------------------------------------------------------------
-    # Метод 2: OCR
-    # -----------------------------------------------------------------------
-
-    def _analyze_ocr(self, image_data: bytes) -> tuple:
-        """
-        Returns: (is_spam, confidence, details)
-        """
-        try:
-            import pytesseract
-        except ImportError:
-            return False, 0.0, "no_ocr"
+        if not self.examples:
+            return False, 0.0, "no_examples (добавьте спам через !addspam)"
 
         try:
             image = Image.open(io.BytesIO(image_data)).convert("RGB")
-
-            try:
-                text = pytesseract.image_to_string(image, lang="rus+eng").lower()
-            except Exception:
-                text = pytesseract.image_to_string(image, lang="eng").lower()
-
-            if not text or len(text.strip()) < 5:
-                return False, 0.0, "no_text"
-
-            # HIGH — одного слова достаточно
-            high_found = [kw for kw in SPAM_KEYWORDS_HIGH if kw.lower() in text]
-            if high_found:
-                confidence = min(0.70 + len(high_found) * 0.07, 0.95)
-                details = "HIGH: " + ", ".join(high_found[:3])
-                logger.info("OCR HIGH: %s", details)
-                return True, confidence, details
-
-            # MEDIUM — нужно 3+ совпадения (было 2, увеличил чтобы убрать фолзы)
-            medium_found = [kw for kw in SPAM_KEYWORDS_MEDIUM if kw.lower() in text]
-            if len(medium_found) >= 3:
-                confidence = min(0.55 + len(medium_found) * 0.08, 0.90)
-                details = "MED: " + ", ".join(medium_found[:3])
-                logger.info("OCR MEDIUM: %s", details)
-                return True, confidence, details
-
-            return False, 0.0, "clean"
-
+            fp = SpamFingerprint(image)
         except Exception as e:
-            logger.debug("OCR ошибка: %s", e)
+            logger.error("Ошибка создания отпечатка: %s", e)
             return False, 0.0, "error"
 
-    # -----------------------------------------------------------------------
-    # Цветовой анализ (только буст, НЕ блокирует)
-    # -----------------------------------------------------------------------
+        # Сравниваем с каждым примером, берём МАКСИМАЛЬНУЮ похожесть
+        best_sim = 0.0
+        best_example = ""
 
-    def _has_casino_palette(self, image_data: bytes) -> bool:
+        for ex in self.examples:
+            sim = fp.similarity(ex["fingerprint"])
+            if sim > best_sim:
+                best_sim = sim
+                best_example = ex.get("filename", "пример")
+
+        is_spam = best_sim >= self.SIMILARITY_THRESHOLD
+        method = f"similar to '{best_example}' ({best_sim:.0%})"
+
+        if is_spam:
+            logger.info("СПАМ: %s | похожесть=%.2f", method, best_sim)
+        else:
+            logger.debug("Чисто: лучшее совпадение %s (%.2f)", best_example, best_sim)
+
+        return is_spam, best_sim, method
+
+    def predict_detailed(self, image_data: bytes) -> dict:
         """
-        Проверяет, похожа ли палитра на казино-сайт.
-        Возвращает True/False — используется ТОЛЬКО для буста OCR.
-        Сам по себе НИКОГДА не блокирует!
+        Детальный анализ — для команды !testdetect.
+
+        Returns:
+            dict с подробностями по каждому примеру.
         """
+        result = {
+            "examples_count": len(self.examples),
+            "matches": [],
+            "is_spam": False,
+            "best_sim": 0.0,
+            "best_example": "",
+        }
+
+        if not self.examples:
+            return result
+
         try:
             image = Image.open(io.BytesIO(image_data)).convert("RGB")
-            thumb = image.resize((80, 80))
-            pixels = list(thumb.getdata())
-            total = len(pixels)
-
-            dark_blue = 0
-            green = 0
-
-            for r, g, b in pixels:
-                h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-                hue = h * 360
-                sat = s * 100
-                val = v * 255
-
-                if (CASINO_DARK_BLUE["hue_min"] <= hue <= CASINO_DARK_BLUE["hue_max"]
-                        and sat >= CASINO_DARK_BLUE["sat_min"]
-                        and val <= CASINO_DARK_BLUE["val_max"]):
-                    dark_blue += 1
-
-                if (CASINO_GREEN["hue_min"] <= hue <= CASINO_GREEN["hue_max"]
-                        and sat >= CASINO_GREEN["sat_min"]
-                        and val >= CASINO_GREEN["val_min"]):
-                    green += 1
-
-            db_ratio = dark_blue / total
-            gr_ratio = green / total
-
-            # Строгий порог: >40% тёмно-синего + есть зелёный
-            return db_ratio >= 0.40 and gr_ratio >= 0.03
-
+            fp = SpamFingerprint(image)
         except Exception:
-            return False
+            return result
 
-    # -----------------------------------------------------------------------
-    # Авто-сохранение хеша
-    # -----------------------------------------------------------------------
+        for i, ex in enumerate(self.examples):
+            sim = fp.similarity(ex["fingerprint"])
+            result["matches"].append({
+                "index": i + 1,
+                "filename": ex.get("filename", "?"),
+                "similarity": sim,
+                "is_match": sim >= self.SIMILARITY_THRESHOLD,
+            })
+            if sim > result["best_sim"]:
+                result["best_sim"] = sim
+                result["best_example"] = ex.get("filename", "?")
 
-    def _auto_save_hash(self, image_data: bytes) -> None:
-        try:
-            import imagehash
-            image = Image.open(io.BytesIO(image_data)).convert("RGB")
-            phash = str(imagehash.phash(image, hash_size=12))
-            if phash not in self.known_hashes:
-                self._save_hash(phash)
-                logger.info("Спам-хеш сохранён: %s", phash)
-        except Exception:
-            pass
+        result["is_spam"] = result["best_sim"] >= self.SIMILARITY_THRESHOLD
+        result["matches"].sort(key=lambda m: m["similarity"], reverse=True)
+
+        return result
 
